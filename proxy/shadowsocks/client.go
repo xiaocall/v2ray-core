@@ -2,54 +2,63 @@ package shadowsocks
 
 import (
 	"context"
-	"time"
 
-	"v2ray.com/core/app/log"
+	"v2ray.com/core"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/retry"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
-	"v2ray.com/core/proxy"
+	"v2ray.com/core/common/task"
+	"v2ray.com/core/features/policy"
+	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
-	"v2ray.com/core/transport/ray"
 )
 
 // Client is a inbound handler for Shadowsocks protocol
 type Client struct {
-	serverPicker protocol.ServerPicker
+	serverPicker  protocol.ServerPicker
+	policyManager policy.Manager
 }
 
 // NewClient create a new Shadowsocks client.
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 	serverList := protocol.NewServerList()
 	for _, rec := range config.Server {
-		serverList.AddServer(protocol.NewServerSpecFromPB(*rec))
+		s, err := protocol.NewServerSpecFromPB(*rec)
+		if err != nil {
+			return nil, newError("failed to parse server spec").Base(err)
+		}
+		serverList.AddServer(s)
 	}
 	if serverList.Size() == 0 {
 		return nil, newError("0 server")
 	}
-	client := &Client{
-		serverPicker: protocol.NewRoundRobinServerPicker(serverList),
-	}
 
+	v := core.MustFromContext(ctx)
+	client := &Client{
+		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
+		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+	}
 	return client, nil
 }
 
 // Process implements OutboundHandler.Process().
-func (v *Client) Process(ctx context.Context, outboundRay ray.OutboundRay, dialer proxy.Dialer) error {
-	destination, ok := proxy.TargetFromContext(ctx)
-	if !ok {
+func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	outbound := session.OutboundFromContext(ctx)
+	if outbound == nil || !outbound.Target.IsValid() {
 		return newError("target not specified")
 	}
+	destination := outbound.Target
 	network := destination.Network
 
 	var server *protocol.ServerSpec
 	var conn internet.Connection
 
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
-		server = v.serverPicker.PickServer()
+		server = c.serverPicker.PickServer()
 		dest := server.Destination()
 		dest.Network = network
 		rawConn, err := dialer.Dial(ctx, dest)
@@ -63,7 +72,7 @@ func (v *Client) Process(ctx context.Context, outboundRay ray.OutboundRay, diale
 	if err != nil {
 		return newError("failed to find an available destination").AtWarning().Base(err)
 	}
-	log.Trace(newError("tunneling request to ", destination, " via ", server.Destination()))
+	newError("tunneling request to ", destination, " via ", server.Destination()).WriteToLog(session.ExportIDToError(ctx))
 
 	defer conn.Close()
 
@@ -79,19 +88,19 @@ func (v *Client) Process(ctx context.Context, outboundRay ray.OutboundRay, diale
 	}
 
 	user := server.PickUser()
-	rawAccount, err := user.GetTypedAccount()
-	if err != nil {
-		return newError("failed to get a valid user account").AtWarning().Base(err)
+	account, ok := user.Account.(*MemoryAccount)
+	if !ok {
+		return newError("user account is not valid")
 	}
-	account := rawAccount.(*ShadowsocksAccount)
 	request.User = user
 
 	if account.OneTimeAuth == Account_Auto || account.OneTimeAuth == Account_Enabled {
 		request.Option |= RequestOptionOneTimeAuth
 	}
 
+	sessionPolicy := c.policyManager.ForLevel(user.Level)
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, time.Minute*5)
+	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 
 	if request.Command == protocol.RequestCommandTCP {
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
@@ -104,29 +113,24 @@ func (v *Client) Process(ctx context.Context, outboundRay ray.OutboundRay, diale
 			return err
 		}
 
-		requestDone := signal.ExecuteAsync(func() error {
-			if err := buf.Copy(outboundRay.OutboundInput(), bodyWriter, buf.UpdateActivity(timer)); err != nil {
-				return err
-			}
-			return nil
-		})
+		requestDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
+			return buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer))
+		}
 
-		responseDone := signal.ExecuteAsync(func() error {
-			defer outboundRay.OutboundOutput().Close()
+		responseDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			responseReader, err := ReadTCPResponse(user, conn)
 			if err != nil {
 				return err
 			}
 
-			if err := buf.Copy(responseReader, outboundRay.OutboundOutput(), buf.UpdateActivity(timer)); err != nil {
-				return err
-			}
+			return buf.Copy(responseReader, link.Writer, buf.UpdateActivity(timer))
+		}
 
-			return nil
-		})
-
-		if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		var responseDoneAndCloseWriter = task.Single(responseDone, task.OnSuccess(task.Close(link.Writer)))
+		if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDoneAndCloseWriter))(); err != nil {
 			return newError("connection ends").Base(err)
 		}
 
@@ -135,33 +139,36 @@ func (v *Client) Process(ctx context.Context, outboundRay ray.OutboundRay, diale
 
 	if request.Command == protocol.RequestCommandUDP {
 
-		writer := buf.NewSequentialWriter(&UDPWriter{
+		writer := &buf.SequentialWriter{Writer: &UDPWriter{
 			Writer:  conn,
 			Request: request,
-		})
+		}}
 
-		requestDone := signal.ExecuteAsync(func() error {
-			if err := buf.Copy(outboundRay.OutboundInput(), writer, buf.UpdateActivity(timer)); err != nil {
+		requestDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
+
+			if err := buf.Copy(link.Reader, writer, buf.UpdateActivity(timer)); err != nil {
 				return newError("failed to transport all UDP request").Base(err)
 			}
 			return nil
-		})
+		}
 
-		responseDone := signal.ExecuteAsync(func() error {
-			defer outboundRay.OutboundOutput().Close()
+		responseDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			reader := &UDPReader{
 				Reader: conn,
 				User:   user,
 			}
 
-			if err := buf.Copy(reader, outboundRay.OutboundOutput(), buf.UpdateActivity(timer)); err != nil {
+			if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 				return newError("failed to transport all UDP response").Base(err)
 			}
 			return nil
-		})
+		}
 
-		if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		var responseDoneAndCloseWriter = task.Single(responseDone, task.OnSuccess(task.Close(link.Writer)))
+		if err := task.Run(task.WithContext(ctx), task.Parallel(requestDone, responseDoneAndCloseWriter))(); err != nil {
 			return newError("connection ends").Base(err)
 		}
 

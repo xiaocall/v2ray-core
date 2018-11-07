@@ -1,86 +1,111 @@
 package crypto
 
 import (
+	"encoding/binary"
 	"io"
 
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
-	"v2ray.com/core/common/serial"
 )
 
-// ChunkSizeDecoder is an utility class to decode size value from bytes.
+// ChunkSizeDecoder is a utility class to decode size value from bytes.
 type ChunkSizeDecoder interface {
-	SizeBytes() int
+	SizeBytes() int32
 	Decode([]byte) (uint16, error)
 }
 
-// ChunkSizeEncoder is an utility class to encode size value into bytes.
+// ChunkSizeEncoder is a utility class to encode size value into bytes.
 type ChunkSizeEncoder interface {
-	SizeBytes() int
+	SizeBytes() int32
 	Encode(uint16, []byte) []byte
+}
+
+type PaddingLengthGenerator interface {
+	MaxPaddingLen() uint16
+	NextPaddingLen() uint16
 }
 
 type PlainChunkSizeParser struct{}
 
-func (PlainChunkSizeParser) SizeBytes() int {
+func (PlainChunkSizeParser) SizeBytes() int32 {
 	return 2
 }
 
 func (PlainChunkSizeParser) Encode(size uint16, b []byte) []byte {
-	return serial.Uint16ToBytes(size, b)
+	binary.BigEndian.PutUint16(b, size)
+	return b[:2]
 }
 
 func (PlainChunkSizeParser) Decode(b []byte) (uint16, error) {
-	return serial.BytesToUint16(b), nil
+	return binary.BigEndian.Uint16(b), nil
+}
+
+type AEADChunkSizeParser struct {
+	Auth *AEADAuthenticator
+}
+
+func (p *AEADChunkSizeParser) SizeBytes() int32 {
+	return 2 + int32(p.Auth.Overhead())
+}
+
+func (p *AEADChunkSizeParser) Encode(size uint16, b []byte) []byte {
+	binary.BigEndian.PutUint16(b, size-uint16(p.Auth.Overhead()))
+	b, err := p.Auth.Seal(b[:0], b[:2])
+	common.Must(err)
+	return b
+}
+
+func (p *AEADChunkSizeParser) Decode(b []byte) (uint16, error) {
+	b, err := p.Auth.Open(b[:0], b)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b) + uint16(p.Auth.Overhead()), nil
 }
 
 type ChunkStreamReader struct {
 	sizeDecoder ChunkSizeDecoder
-	reader      buf.Reader
+	reader      *buf.BufferedReader
 
 	buffer       []byte
-	leftOver     buf.MultiBuffer
-	leftOverSize int
+	leftOverSize int32
+	maxNumChunk  uint32
+	numChunk     uint32
 }
 
 func NewChunkStreamReader(sizeDecoder ChunkSizeDecoder, reader io.Reader) *ChunkStreamReader {
-	return &ChunkStreamReader{
-		sizeDecoder: sizeDecoder,
-		reader:      buf.NewReader(reader),
-		buffer:      make([]byte, sizeDecoder.SizeBytes()),
-		leftOver:    buf.NewMultiBufferCap(16),
-	}
+	return NewChunkStreamReaderWithChunkCount(sizeDecoder, reader, 0)
 }
 
-func (r *ChunkStreamReader) readAtLeast(size int) error {
-	mb := r.leftOver
-	r.leftOver = nil
-	for mb.Len() < size {
-		extra, err := r.reader.ReadMultiBuffer()
-		if err != nil {
-			mb.Release()
-			return err
-		}
-		mb.AppendMulti(extra)
+func NewChunkStreamReaderWithChunkCount(sizeDecoder ChunkSizeDecoder, reader io.Reader, maxNumChunk uint32) *ChunkStreamReader {
+	r := &ChunkStreamReader{
+		sizeDecoder: sizeDecoder,
+		buffer:      make([]byte, sizeDecoder.SizeBytes()),
+		maxNumChunk: maxNumChunk,
 	}
-	r.leftOver = mb
+	if breader, ok := reader.(*buf.BufferedReader); ok {
+		r.reader = breader
+	} else {
+		r.reader = &buf.BufferedReader{Reader: buf.NewReader(reader)}
+	}
 
-	return nil
+	return r
 }
 
 func (r *ChunkStreamReader) readSize() (uint16, error) {
-	if r.sizeDecoder.SizeBytes() > r.leftOver.Len() {
-		if err := r.readAtLeast(r.sizeDecoder.SizeBytes() - r.leftOver.Len()); err != nil {
-			return 0, err
-		}
+	if _, err := io.ReadFull(r.reader, r.buffer); err != nil {
+		return 0, err
 	}
-	common.Must2(io.ReadFull(&r.leftOver, r.buffer))
 	return r.sizeDecoder.Decode(r.buffer)
 }
 
 func (r *ChunkStreamReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	size := r.leftOverSize
 	if size == 0 {
+		r.numChunk++
+		if r.maxNumChunk > 0 && r.numChunk > r.maxNumChunk {
+			return nil, io.EOF
+		}
 		nextSize, err := r.readSize()
 		if err != nil {
 			return nil, err
@@ -88,33 +113,16 @@ func (r *ChunkStreamReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if nextSize == 0 {
 			return nil, io.EOF
 		}
-		size = int(nextSize)
+		size = int32(nextSize)
 	}
+	r.leftOverSize = size
 
-	if r.leftOver.IsEmpty() {
-		if err := r.readAtLeast(1); err != nil {
-			return nil, err
-		}
-	}
-
-	leftOverLen := r.leftOver.Len()
-	if size >= leftOverLen {
-		mb := r.leftOver
-		r.leftOverSize = size - leftOverLen
-		r.leftOver = nil
+	mb, err := r.reader.ReadAtMost(size)
+	if !mb.IsEmpty() {
+		r.leftOverSize -= mb.Len()
 		return mb, nil
 	}
-
-	mb := r.leftOver.SliceBySize(size)
-	mbLen := mb.Len()
-	if mbLen != size {
-		b := buf.New()
-		common.Must(b.Reset(buf.ReadFullFrom(&r.leftOver, size-mbLen)))
-		mb.Append(b)
-	}
-	r.leftOverSize = 0
-
-	return mb, nil
+	return nil, err
 }
 
 type ChunkStreamWriter struct {
@@ -138,10 +146,7 @@ func (w *ChunkStreamWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		slice := mb.SliceBySize(sliceSize)
 
 		b := buf.New()
-		common.Must(b.Reset(func(buffer []byte) (int, error) {
-			w.sizeEncoder.Encode(uint16(slice.Len()), buffer[:0])
-			return w.sizeEncoder.SizeBytes(), nil
-		}))
+		w.sizeEncoder.Encode(uint16(slice.Len()), b.Extend(w.sizeEncoder.SizeBytes()))
 		mb2Write.Append(b)
 		mb2Write.AppendMulti(slice)
 

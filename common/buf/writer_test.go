@@ -4,14 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
-	"testing"
-
-	"context"
 	"io"
+	"testing"
 
 	"v2ray.com/core/common"
 	. "v2ray.com/core/common/buf"
-	"v2ray.com/core/transport/ray"
+	"v2ray.com/core/transport/pipe"
 	. "v2ray.com/ext/assert"
 )
 
@@ -19,7 +17,7 @@ func TestWriter(t *testing.T) {
 	assert := With(t)
 
 	lb := New()
-	assert(lb.AppendSupplier(ReadFrom(rand.Reader)), IsNil)
+	common.Must2(lb.ReadFrom(rand.Reader))
 
 	expectedBytes := append([]byte(nil), lb.Bytes()...)
 
@@ -36,23 +34,27 @@ func TestWriter(t *testing.T) {
 func TestBytesWriterReadFrom(t *testing.T) {
 	assert := With(t)
 
-	cache := ray.NewStream(context.Background())
-	reader := bufio.NewReader(io.LimitReader(rand.Reader, 8192))
-	writer := NewBufferedWriter(cache)
+	const size = 50000
+	pReader, pWriter := pipe.New(pipe.WithSizeLimit(size))
+	reader := bufio.NewReader(io.LimitReader(rand.Reader, size))
+	writer := NewBufferedWriter(pWriter)
 	writer.SetBuffered(false)
-	_, err := reader.WriteTo(writer)
-	assert(err, IsNil)
+	nBytes, err := reader.WriteTo(writer)
+	assert(nBytes, Equals, int64(size))
+	if err != nil {
+		t.Fatal("expect success, but actually error: ", err.Error())
+	}
 
-	mb, err := cache.ReadMultiBuffer()
+	mb, err := pReader.ReadMultiBuffer()
 	assert(err, IsNil)
-	assert(mb.Len(), Equals, 8192)
+	assert(mb.Len(), Equals, int32(size))
 }
 
 func TestDiscardBytes(t *testing.T) {
 	assert := With(t)
 
 	b := New()
-	common.Must(b.Reset(ReadFullFrom(rand.Reader, Size)))
+	common.Must2(b.ReadFullFrom(rand.Reader, Size))
 
 	nBytes, err := io.Copy(DiscardBytes, b)
 	assert(nBytes, Equals, int64(Size))
@@ -67,7 +69,27 @@ func TestDiscardBytesMultiBuffer(t *testing.T) {
 	common.Must2(buffer.ReadFrom(io.LimitReader(rand.Reader, size)))
 
 	r := NewReader(buffer)
-	nBytes, err := io.Copy(DiscardBytes, NewBufferedReader(r))
+	nBytes, err := io.Copy(DiscardBytes, &BufferedReader{Reader: r})
 	assert(nBytes, Equals, int64(size))
 	assert(err, IsNil)
+}
+
+func TestWriterInterface(t *testing.T) {
+	{
+		var writer interface{} = (*BufferToBytesWriter)(nil)
+		switch writer.(type) {
+		case Writer, io.Writer, io.ReaderFrom:
+		default:
+			t.Error("BufferToBytesWriter is not Writer, io.Writer or io.ReaderFrom")
+		}
+	}
+
+	{
+		var writer interface{} = (*BufferedWriter)(nil)
+		switch writer.(type) {
+		case Writer, io.Writer, io.ReaderFrom, io.ByteWriter:
+		default:
+			t.Error("BufferedWriter is not Writer, io.Writer, io.ReaderFrom or io.ByteWriter")
+		}
+	}
 }

@@ -1,7 +1,5 @@
 package protocol
 
-import "time"
-
 func (u *User) GetTypedAccount() (Account, error) {
 	if u.GetAccount() == nil {
 		return nil, newError("Account missing").AtWarning()
@@ -20,19 +18,22 @@ func (u *User) GetTypedAccount() (Account, error) {
 	return nil, newError("Unknown account type: ", u.Account.Type)
 }
 
-func (u *User) GetSettings() UserSettings {
-	settings := UserSettings{}
-	switch u.Level {
-	case 0:
-		settings.PayloadTimeout = time.Second * 30
-	case 1:
-		settings.PayloadTimeout = time.Minute * 2
-	default:
-		settings.PayloadTimeout = time.Minute * 5
+func (u *User) ToMemoryUser() (*MemoryUser, error) {
+	account, err := u.GetTypedAccount()
+	if err != nil {
+		return nil, err
 	}
-	return settings
+	return &MemoryUser{
+		Account: account,
+		Email:   u.Email,
+		Level:   u.Level,
+	}, nil
 }
 
-type UserSettings struct {
-	PayloadTimeout time.Duration
+// MemoryUser is a parsed form of User, to reduce number of parsing of Account proto.
+type MemoryUser struct {
+	// Account is the parsed account of the protocol.
+	Account Account
+	Email   string
+	Level   uint32
 }

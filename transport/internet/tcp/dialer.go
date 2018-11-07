@@ -3,38 +3,31 @@ package tcp
 import (
 	"context"
 
-	"v2ray.com/core/app/log"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/tls"
 )
 
 func getTCPSettingsFromContext(ctx context.Context) *Config {
-	rawTCPSettings := internet.TransportSettingsFromContext(ctx)
+	rawTCPSettings := internet.StreamSettingsFromContext(ctx)
 	if rawTCPSettings == nil {
 		return nil
 	}
-	return rawTCPSettings.(*Config)
+	return rawTCPSettings.ProtocolSettings.(*Config)
 }
 
+// Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error) {
-	log.Trace(newError("dailing TCP to ", dest))
-	src := internet.DialerSourceFromContext(ctx)
-
-	conn, err := internet.DialSystem(ctx, src, dest)
+	newError("dialing TCP to ", dest).WriteToLog(session.ExportIDToError(ctx))
+	conn, err := internet.DialSystem(ctx, dest)
 	if err != nil {
 		return nil, err
 	}
-	if securitySettings := internet.SecuritySettingsFromContext(ctx); securitySettings != nil {
-		tlsConfig, ok := securitySettings.(*tls.Config)
-		if ok {
-			if dest.Address.Family().IsDomain() {
-				tlsConfig.OverrideServerNameIfEmpty(dest.Address.Domain())
-			}
-			config := tlsConfig.GetTLSConfig()
-			conn = tls.Client(conn, config)
-		}
+
+	if config := tls.ConfigFromContext(ctx); config != nil {
+		conn = tls.Client(conn, config.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("h2")))
 	}
 
 	tcpSettings := getTCPSettingsFromContext(ctx)
@@ -53,5 +46,5 @@ func Dial(ctx context.Context, dest net.Destination) (internet.Connection, error
 }
 
 func init() {
-	common.Must(internet.RegisterTransportDialer(internet.TransportProtocol_TCP, Dial))
+	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
 }

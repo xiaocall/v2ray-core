@@ -5,32 +5,35 @@ import (
 	"sync"
 	"time"
 
-	"v2ray.com/core/app/dispatcher"
-	"v2ray.com/core/app/log"
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal"
-	"v2ray.com/core/transport/ray"
+	"v2ray.com/core/features/routing"
+	"v2ray.com/core/transport"
 )
 
-type ResponseCallback func(payload *buf.Buffer)
+type ResponseCallback func(ctx context.Context, payload *buf.Buffer)
 
 type connEntry struct {
-	inbound ray.InboundRay
-	timer   signal.ActivityUpdater
-	cancel  context.CancelFunc
+	link   *transport.Link
+	timer  signal.ActivityUpdater
+	cancel context.CancelFunc
 }
 
 type Dispatcher struct {
 	sync.RWMutex
 	conns      map[net.Destination]*connEntry
-	dispatcher dispatcher.Interface
+	dispatcher routing.Dispatcher
+	callback   ResponseCallback
 }
 
-func NewDispatcher(dispatcher dispatcher.Interface) *Dispatcher {
+func NewDispatcher(dispatcher routing.Dispatcher, callback ResponseCallback) *Dispatcher {
 	return &Dispatcher{
 		conns:      make(map[net.Destination]*connEntry),
 		dispatcher: dispatcher,
+		callback:   callback,
 	}
 }
 
@@ -38,13 +41,13 @@ func (v *Dispatcher) RemoveRay(dest net.Destination) {
 	v.Lock()
 	defer v.Unlock()
 	if conn, found := v.conns[dest]; found {
-		conn.inbound.InboundInput().Close()
-		conn.inbound.InboundOutput().Close()
+		common.Close(conn.link.Reader)
+		common.Close(conn.link.Writer)
 		delete(v.conns, dest)
 	}
 }
 
-func (v *Dispatcher) getInboundRay(dest net.Destination, callback ResponseCallback) *connEntry {
+func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) *connEntry {
 	v.Lock()
 	defer v.Unlock()
 
@@ -52,34 +55,34 @@ func (v *Dispatcher) getInboundRay(dest net.Destination, callback ResponseCallba
 		return entry
 	}
 
-	log.Trace(newError("establishing new connection for ", dest))
+	newError("establishing new connection for ", dest).WriteToLog()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	removeRay := func() {
 		cancel()
 		v.RemoveRay(dest)
 	}
 	timer := signal.CancelAfterInactivity(ctx, removeRay, time.Second*4)
-	inboundRay, _ := v.dispatcher.Dispatch(ctx, dest)
+	link, _ := v.dispatcher.Dispatch(ctx, dest)
 	entry := &connEntry{
-		inbound: inboundRay,
-		timer:   timer,
-		cancel:  removeRay,
+		link:   link,
+		timer:  timer,
+		cancel: removeRay,
 	}
 	v.conns[dest] = entry
-	go handleInput(ctx, entry, callback)
+	go handleInput(ctx, entry, v.callback)
 	return entry
 }
 
-func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, payload *buf.Buffer, callback ResponseCallback) {
+func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, payload *buf.Buffer) {
 	// TODO: Add user to destString
-	log.Trace(newError("dispatch request to: ", destination).AtDebug())
+	newError("dispatch request to: ", destination).AtDebug().WriteToLog(session.ExportIDToError(ctx))
 
-	conn := v.getInboundRay(destination, callback)
-	outputStream := conn.inbound.InboundInput()
+	conn := v.getInboundRay(ctx, destination)
+	outputStream := conn.link.Writer
 	if outputStream != nil {
 		if err := outputStream.WriteMultiBuffer(buf.NewMultiBufferValue(payload)); err != nil {
-			log.Trace(newError("failed to write first UDP payload").Base(err))
+			newError("failed to write first UDP payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
 			conn.cancel()
 			return
 		}
@@ -87,7 +90,9 @@ func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, 
 }
 
 func handleInput(ctx context.Context, conn *connEntry, callback ResponseCallback) {
-	input := conn.inbound.InboundOutput()
+	defer conn.cancel()
+
+	input := conn.link.Reader
 	timer := conn.timer
 
 	for {
@@ -99,13 +104,12 @@ func handleInput(ctx context.Context, conn *connEntry, callback ResponseCallback
 
 		mb, err := input.ReadMultiBuffer()
 		if err != nil {
-			log.Trace(newError("failed to handl UDP input").Base(err))
-			conn.cancel()
+			newError("failed to handle UDP input").Base(err).WriteToLog(session.ExportIDToError(ctx))
 			return
 		}
 		timer.Update()
 		for _, b := range mb {
-			callback(b)
+			callback(ctx, b)
 		}
 	}
 }

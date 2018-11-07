@@ -1,72 +1,134 @@
 package outbound
 
-//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg outbound -path App,Proxyman,Outbound
+//go:generate errorgen
 
 import (
 	"context"
 	"sync"
 
+	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
 	"v2ray.com/core/common"
+	"v2ray.com/core/features/outbound"
 )
 
 // Manager is to manage all outbound handlers.
 type Manager struct {
-	sync.RWMutex
-	defaultHandler *Handler
-	taggedHandler  map[string]*Handler
+	access           sync.RWMutex
+	defaultHandler   outbound.Handler
+	taggedHandler    map[string]outbound.Handler
+	untaggedHandlers []outbound.Handler
+	running          bool
 }
 
 // New creates a new Manager.
 func New(ctx context.Context, config *proxyman.OutboundConfig) (*Manager, error) {
-	return &Manager{
-		taggedHandler: make(map[string]*Handler),
-	}, nil
+	m := &Manager{
+		taggedHandler: make(map[string]outbound.Handler),
+	}
+	return m, nil
 }
 
-// Interface implements Application.Interface.
-func (*Manager) Interface() interface{} {
-	return (*proxyman.OutboundHandlerManager)(nil)
+// Type implements common.HasType.
+func (m *Manager) Type() interface{} {
+	return outbound.ManagerType()
 }
 
-// Start implements Application.Start
-func (*Manager) Start() error { return nil }
+// Start implements core.Feature
+func (m *Manager) Start() error {
+	m.access.Lock()
+	defer m.access.Unlock()
 
-// Close implements Application.Close
-func (*Manager) Close() {}
+	m.running = true
 
-func (m *Manager) GetDefaultHandler() proxyman.OutboundHandler {
-	m.RLock()
-	defer m.RUnlock()
+	for _, h := range m.taggedHandler {
+		if err := h.Start(); err != nil {
+			return err
+		}
+	}
+
+	for _, h := range m.untaggedHandlers {
+		if err := h.Start(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Close implements core.Feature
+func (m *Manager) Close() error {
+	m.access.Lock()
+	defer m.access.Unlock()
+
+	m.running = false
+
+	for _, h := range m.taggedHandler {
+		h.Close()
+	}
+
+	for _, h := range m.untaggedHandlers {
+		h.Close()
+	}
+
+	return nil
+}
+
+// GetDefaultHandler implements outbound.Manager.
+func (m *Manager) GetDefaultHandler() outbound.Handler {
+	m.access.RLock()
+	defer m.access.RUnlock()
+
 	if m.defaultHandler == nil {
 		return nil
 	}
 	return m.defaultHandler
 }
 
-func (m *Manager) GetHandler(tag string) proxyman.OutboundHandler {
-	m.RLock()
-	defer m.RUnlock()
+// GetHandler implements outbound.Manager.
+func (m *Manager) GetHandler(tag string) outbound.Handler {
+	m.access.RLock()
+	defer m.access.RUnlock()
 	if handler, found := m.taggedHandler[tag]; found {
 		return handler
 	}
 	return nil
 }
 
-func (m *Manager) AddHandler(ctx context.Context, config *proxyman.OutboundHandlerConfig) error {
-	m.Lock()
-	defer m.Unlock()
+// AddHandler implements outbound.Manager.
+func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) error {
+	m.access.Lock()
+	defer m.access.Unlock()
 
-	handler, err := NewHandler(ctx, config)
-	if err != nil {
-		return err
-	}
 	if m.defaultHandler == nil {
 		m.defaultHandler = handler
 	}
 
-	if len(config.Tag) > 0 {
-		m.taggedHandler[config.Tag] = handler
+	tag := handler.Tag()
+	if len(tag) > 0 {
+		m.taggedHandler[tag] = handler
+	} else {
+		m.untaggedHandlers = append(m.untaggedHandlers, handler)
+	}
+
+	if m.running {
+		return handler.Start()
+	}
+
+	return nil
+}
+
+// RemoveHandler implements outbound.Manager.
+func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
+	if len(tag) == 0 {
+		return common.ErrNoClue
+	}
+	m.access.Lock()
+	defer m.access.Unlock()
+
+	delete(m.taggedHandler, tag)
+	if m.defaultHandler.Tag() == tag {
+		m.defaultHandler = nil
 	}
 
 	return nil
@@ -75,5 +137,8 @@ func (m *Manager) AddHandler(ctx context.Context, config *proxyman.OutboundHandl
 func init() {
 	common.Must(common.RegisterConfig((*proxyman.OutboundConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return New(ctx, config.(*proxyman.OutboundConfig))
+	}))
+	common.Must(common.RegisterConfig((*core.OutboundHandlerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return NewHandler(ctx, config.(*core.OutboundHandlerConfig))
 	}))
 }

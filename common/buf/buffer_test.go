@@ -1,11 +1,13 @@
 package buf_test
 
 import (
+	"bytes"
 	"crypto/rand"
 	"testing"
 
+	"v2ray.com/core/common"
 	. "v2ray.com/core/common/buf"
-	"v2ray.com/core/common/serial"
+	"v2ray.com/core/common/compare"
 	. "v2ray.com/ext/assert"
 )
 
@@ -16,11 +18,11 @@ func TestBufferClear(t *testing.T) {
 	defer buffer.Release()
 
 	payload := "Bytes"
-	buffer.Append([]byte(payload))
-	assert(buffer.Len(), Equals, len(payload))
+	buffer.Write([]byte(payload))
+	assert(buffer.Len(), Equals, int32(len(payload)))
 
 	buffer.Clear()
-	assert(buffer.Len(), Equals, 0)
+	assert(buffer.Len(), Equals, int32(0))
 }
 
 func TestBufferIsEmpty(t *testing.T) {
@@ -38,46 +40,59 @@ func TestBufferString(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()
 
-	assert(buffer.AppendSupplier(serial.WriteString("Test String")), IsNil)
+	common.Must2(buffer.WriteString("Test String"))
 	assert(buffer.String(), Equals, "Test String")
 }
 
-func TestBufferWrite(t *testing.T) {
-	assert := With(t)
+func TestBufferSlice(t *testing.T) {
+	{
+		b := New()
+		common.Must2(b.Write([]byte("abcd")))
+		bytes := b.BytesFrom(-2)
+		if err := compare.BytesEqualWithDetail(bytes, []byte{'c', 'd'}); err != nil {
+			t.Error(err)
+		}
+	}
 
-	buffer := NewLocal(8)
-	nBytes, err := buffer.Write([]byte("abcd"))
-	assert(err, IsNil)
-	assert(nBytes, Equals, 4)
-	nBytes, err = buffer.Write([]byte("abcde"))
-	assert(err, IsNil)
-	assert(nBytes, Equals, 4)
-	assert(buffer.String(), Equals, "abcdabcd")
+	{
+		b := New()
+		common.Must2(b.Write([]byte("abcd")))
+		bytes := b.BytesTo(-2)
+		if err := compare.BytesEqualWithDetail(bytes, []byte{'a', 'b'}); err != nil {
+			t.Error(err)
+		}
+	}
+
+	{
+		b := New()
+		common.Must2(b.Write([]byte("abcd")))
+		bytes := b.BytesRange(-3, -1)
+		if err := compare.BytesEqualWithDetail(bytes, []byte{'b', 'c'}); err != nil {
+			t.Error(err)
+		}
+	}
 }
 
-func TestSyncPool(t *testing.T) {
-	assert := With(t)
+func TestBufferReadFullFrom(t *testing.T) {
+	payload := make([]byte, 1024)
+	common.Must2(rand.Read(payload))
 
-	p := NewSyncPool(32)
-	b := p.Allocate()
-	assert(b.Len(), Equals, 0)
+	reader := bytes.NewReader(payload)
+	b := New()
+	n, err := b.ReadFullFrom(reader, 1024)
+	common.Must(err)
+	if n != 1024 {
+		t.Error("expect reading 1024 bytes, but actually ", n)
+	}
 
-	assert(b.AppendSupplier(ReadFrom(rand.Reader)), IsNil)
-	assert(b.Len(), Equals, 32)
-
-	b.Release()
+	if err := compare.BytesEqualWithDetail(payload, b.Bytes()); err != nil {
+		t.Error(err)
+	}
 }
 
 func BenchmarkNewBuffer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buffer := New()
-		buffer.Release()
-	}
-}
-
-func BenchmarkNewLocalBuffer(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		buffer := NewLocal(Size)
 		buffer.Release()
 	}
 }
